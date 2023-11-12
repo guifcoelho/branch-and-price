@@ -8,11 +8,11 @@ import highspy, random, time, math
 CG_GAP_REL = 1e-4
 
 # Random seeds for reproducibility
-random.seed(100)
 SEED = 100
+random.seed(SEED)
 
 # Instance parameters
-NumberItems = 40
+NumberItems = 200
 ItemWeights = [round(random.uniform(1, 10), 1) for _ in range(NumberItems)]
 BinCapacity = 15
 
@@ -115,6 +115,7 @@ def createMasterProblem(columns: list):
     m = highspy.Highs()
     m.setOptionValue('output_flag', False)
     m.setOptionValue('random_seed', SEED)
+    # m.setOptionValue('solver', 'ipm')
     
     m.addVars(len(columns), [0]*len(columns), [1]*len(columns))
     
@@ -146,6 +147,7 @@ def createMasterProblem(columns: list):
 #   z_{i} = 1 if item i is packed, 0 otherwise
 #
 def solveSubproblemExact(duals):
+    assert len(duals) == NumberItems
     m = highspy.Highs()
     m.setOptionValue('output_flag', False)
     m.setOptionValue('random_seed', SEED)
@@ -178,6 +180,7 @@ def solveSubproblemExact(duals):
 
 # Solve the knapsack subproblem with greedy heuristic
 def solveSubproblemNotExact(duals):
+    assert len(duals) == NumberItems
     total_weight = 0
     new_column = []
     
@@ -192,7 +195,8 @@ def solveSubproblemNotExact(duals):
 #
 # Generate columns for the master problem
 #
-def generateColumns(columns: list, m, msg=True, solve_exact = False, start_time = 0):
+def generateColumns(columns_: list[list[int]], m, msg=True, solve_exact = False, start_time = 0, in_branch_and_price = False):
+    columns = [column.copy() for column in columns_]
     best_gap = math.inf
 
     iter = 0
@@ -203,9 +207,12 @@ def generateColumns(columns: list, m, msg=True, solve_exact = False, start_time 
 
         # solve sub problem to generate new column
         if not solve_exact:
-            obj_sub, new_column = solveSubproblemNotExact(duals)
+            obj_sub, new_column = solveSubproblemNotExact(duals[:NumberItems])
         else:
-            obj_sub, new_column = solveSubproblemExact(duals)
+            obj_sub, new_column = solveSubproblemExact(duals[:NumberItems])
+
+        if in_branch_and_price:
+            obj_sub -= duals[-1]
 
         iter += 1     
         obj = ub + min(0, obj_sub)  # we terminate if obj_sub >= 0
@@ -238,13 +245,16 @@ def generateColumns(columns: list, m, msg=True, solve_exact = False, start_time 
 
         # Adds a new column to the master problem
         columns += [new_column]
+        rows = new_column.copy()
+        if in_branch_and_price:
+            rows += [NumberItems]
         m.addCol(
             1,                      # cost
             0,                      # lower bound
             1,                      # upper bound
-            len(new_column),        # number of rows
-            new_column,             # indexes of rows
-            [1]*len(new_column)     # coefficients of rows
+            len(rows),              # number of rows
+            rows,                   # indexes of rows
+            [1]*len(rows)           # coefficients of rows
         )
 
         # Solves the master problem
@@ -295,8 +305,10 @@ def solveNode(node: Node, columns: list[list[int]], m):
     m.run()
 
     if m.getModelStatus() == highspy.HighsModelStatus.kOptimal:        
-        m, columns, vals = generateColumns(columns, m, msg=False, solve_exact=False) # Generate columns quickly
-        m, columns, vals = generateColumns(columns, m, msg=False, solve_exact=True)  # Prove optimality on node
+        m, columns, vals = generateColumns(columns, m, msg=False, solve_exact=False, in_branch_and_price=True) # Generate columns quickly
+        m, columns, vals = generateColumns(columns, m, msg=False, solve_exact=True, in_branch_and_price=True)  # Prove optimality on node
+
+        assert len(columns) == len(vals)
 
         node.value = sum(vals)
         node.final_columns = columns
@@ -320,8 +332,10 @@ def solveNode(node: Node, columns: list[list[int]], m):
 # Specifically, the code "up-branches" columns with fractional value in the RMP solution, i.e., forces specific columns 
 # to be selected in RMP.  The subproblems don't need to explicitly enforce this constraint (unlike other branching strategies).
 #
-def branchAndPrice(m, vals, columns, start_time=0):    
-    header = ["NodesExpl", "TreeSize", "CurrCols", "FracCols", "UB", "Time"]
+def branchAndPrice(m, vals, columns, start_time=0):
+    log_start_time = time.perf_counter() 
+    
+    header = ["NodesExpl", "TreeSize", "CurrCols", "BstFracCols", "IntSols", "UB", "Time"]
     row_format ="{:>12}" * (len(header))
     print(row_format.format(*header))
 
@@ -342,11 +356,21 @@ def branchAndPrice(m, vals, columns, start_time=0):
     best_node = None
     best_count_frac_columns = math.inf
     count_nodes_visited = 0
+    count_int_sols = 0
 
     # if no fractional columns, then root node is an optimal integer solution
     if len(root_node.final_fractional_columns) == 0:
         best_node = root_node
         print(row_format.format(*[0, 0, len(columns), 0, best_node.value, f"{round(time.perf_counter()-start_time, 2) :.2f}" ]))
+
+    # Adds cut 
+    m.addRow(
+        rmp_LB,                                              # lhs
+        highspy.kHighsInf,                                   # rhs
+        len(columns),                                        # Number of non-zero variables
+        list(range(len(columns))),                           # Indexes of variable
+        [1] * len(columns)                                   # Coefficients of variables
+    )
 
     # explore branches, looking for optimal integer solution
     while len(branch_tree) > 0:
@@ -358,37 +382,47 @@ def branchAndPrice(m, vals, columns, start_time=0):
         node = min(branch_tree, key=lambda node: (
             -node.layer,
             len(node.parent.final_fractional_columns) if node.parent is not None else math.inf,
-            -node.parent.final_columns_vals[node.assigned_columns[-1]] if node.parent is not None else 0
+            # -node.parent.final_columns_vals[node.assigned_columns[-1]] if node.parent is not None else 0
         ))
         branch_tree.remove(node)
 
         # Solves the node with column generation
         mp_is_feasible, m, node = solveNode(node, columns, m)
+        if mp_is_feasible and len(node.final_columns) > len(columns):
+            columns = node.final_columns
         count_nodes_visited += 1
 
         # Only add columns if the master problem is feasible
         # Prune nodes that cannot lead to optimal solution        
         if mp_is_feasible and node.value < best_obj:
-            columns = node.final_columns            
             count_fractional_columns = len(node.final_fractional_columns)
 
             # if no fractional columns, then this is an integer solution
-            # update the best solution here for console output
-            if count_fractional_columns == 0 and node.value < best_obj:
-                best_obj = int(round(node.value, 0))  # avoid float precision issues
-                best_node = node
+            if count_fractional_columns == 0:
+                count_int_sols += 1
+
+                # update the best solution here for console output
+                if node.value < best_obj:
+                    best_obj = int(round(node.value, 0))  # avoid float precision issues
+                    best_node = node
+
+                    # stop if we've found a provably optimal solution (using lower bound from RMP root node)
+                    if rmp_LB == best_obj:
+                        break
 
             # found a less fractional solution or enough time has elapsed
-            if count_fractional_columns < best_count_frac_columns or time.perf_counter()-start_time > 5:
-                best_count_frac_columns = count_fractional_columns
+            if count_fractional_columns < best_count_frac_columns or time.perf_counter()-log_start_time > 5:
+                best_count_frac_columns = min(best_count_frac_columns, count_fractional_columns)
                 print(row_format.format(*[
                     count_nodes_visited,
                     len(branch_tree),
                     len(columns),
                     best_count_frac_columns,
-                    best_obj if best_obj < math.inf else "-",
+                    count_int_sols,
+                    best_obj if best_obj < math.inf else "inf",
                     f"{round(time.perf_counter()-start_time, 2) :.2f}"
                 ]))
+                log_start_time = time.perf_counter()
 
             # add all fractional columns as new branches
             if count_fractional_columns > 0:
@@ -400,11 +434,6 @@ def branchAndPrice(m, vals, columns, start_time=0):
                         new_node = Node(node.layer + 1, new_assigned_columns, node)
                         branch_tree = [new_node] + branch_tree
                         branch_tree_dict[key] = new_node
-
-            # if no fractional columns, then this is an integer solution
-            # stop if we've found a provably optimal solution (using lower bound from RMP root node)
-            elif rmp_LB == best_obj:
-                break
 
     # explored the entire tree, so best found solution is optimal
     if best_node is not None:
@@ -424,17 +453,17 @@ if __name__ == '__main__':
     print(f"Greedy estimate: {len(greedy_bins)} bins")
     print(f"Finished in {greedy_time: .2f}s\n")
 
-    start_time = time.perf_counter()
-    compact_bins = solveCompactModel()
-    compact_time = time.perf_counter()-start_time
+    # start_time = time.perf_counter()
+    # compact_bins = solveCompactModel()
+    # compact_time = time.perf_counter()-start_time
 
-    print(f"\nSolution by compact model: {len(compact_bins)} bins")
-    for bin, items in enumerate(compact_bins):
-        tt_weight = round(sum(ItemWeights[i] for i in items))
-        print(f"Bin {bin+1} ({tt_weight} <= {BinCapacity}): {items}")
-        assert tt_weight <= BinCapacity
+    # print(f"\nSolution by compact model: {len(compact_bins)} bins")
+    # for bin, items in enumerate(compact_bins):
+    #     tt_weight = round(sum(ItemWeights[i] for i in items))
+    #     print(f"Bin {bin+1} ({tt_weight} <= {BinCapacity}): {items}")
+    #     assert tt_weight <= BinCapacity
 
-    print(f"Finished in {compact_time: .2f}s\n")
+    # print(f"Finished in {compact_time: .2f}s\n")
 
     # start with initial set of columns for feasible master problem
     start_time = time.perf_counter()

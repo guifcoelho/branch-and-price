@@ -14,7 +14,7 @@ random.seed(SEED)
 
 
 # Instance parameters
-NumberItems = 150
+NumberItems = 200
 ItemWeights = [round(random.uniform(1, 10), 1) for _ in range(NumberItems)]
 BinCapacity = 15
 
@@ -117,7 +117,7 @@ def createMasterProblem(columns: list):
     m = highspy.Highs()
     m.setOptionValue('output_flag', False)
     m.setOptionValue('random_seed', SEED)
-    m.setOptionValue('solver', 'ipm')
+    # m.setOptionValue('solver', 'ipm')
     
     m.addVars(len(columns), [0]*len(columns), [1]*len(columns))
     
@@ -336,10 +336,7 @@ def generateColumns(columns: list, mp: highspy.Highs, msg=True, solve_exact = Fa
 
         # terminate if no column with good reduced cost is found
         # or if the subproblem is infeasible
-        if obj_sub >= 0 or gap < CG_GAP_REL:# or len(new_column) == 0:
-            # break
-            num_cols = mp.getNumCol()
-            assert num_cols == len(columns_), f"{iter} {solve_exact} - {num_cols} != {len(columns_)}"
+        if obj_sub >= 0 or gap < CG_GAP_REL:
             return m, columns_, list(solution.col_value)
 
         # Adds a new column to the master problem
@@ -347,7 +344,6 @@ def generateColumns(columns: list, mp: highspy.Highs, msg=True, solve_exact = Fa
         rows = new_column.copy()
         if branching_rule is not None:
             rows += [NumberItems]
-
         mp.addCol(
             1,                      # cost
             0,                      # lower bound
@@ -356,13 +352,9 @@ def generateColumns(columns: list, mp: highspy.Highs, msg=True, solve_exact = Fa
             rows,                   # indexes of rows
             [1]*len(rows)           # coefficients of rows
         )
-        num_cols = mp.getNumCol()
-        assert num_cols == len(columns_), f"{iter} {solve_exact} - {num_cols} != {len(columns_)}"
 
         # Solves the master problem
         mp.run()
-
-    # return m, columns_, list(solution.col_value)
 
 
 #
@@ -404,15 +396,12 @@ def getRowsToBranch(node: Node):
                 if 1e-6 < sum_columns < 1-1e-6:
                     rows += [(r, s, cols_with_both, sum_columns)]
 
-    return sorted(rows, key = lambda el: -el[3])
+    return rows#sorted(rows, key = lambda el: abs(el[3]-0.5))[:min(len(rows), math.ceil(NumberItems/2))]
 
 
 def solveNode(node: Node, columns: list[list[int]], model: highspy.Highs):
     new_column_set = [column.copy() for column in columns]
-
-    count_columns = len(new_column_set)
-    num_cols = model.getNumCol()
-    assert count_columns == num_cols, f"{num_cols} != {count_columns}"
+    assert len(new_column_set) == model.getNumCol()
 
     # Retrives the feasible columns and turns off all the infeasible ones
     feasible_columns = getFeasibleColumns(columns, node.branching_rule)
@@ -428,34 +417,15 @@ def solveNode(node: Node, columns: list[list[int]], model: highspy.Highs):
     model.run()
 
     if model.getModelStatus() == highspy.HighsModelStatus.kOptimal:
-        count_columns = len(new_column_set)
-        num_cols = model.getNumCol()
-        assert count_columns == num_cols, f"{num_cols} != {count_columns}"
-
-        # try:
-        
         # model, new_column_set, vals = generateColumns(new_column_set, model, msg=False, solve_exact=False, branching_rule=node.branching_rule) # Generate columns quickly
-
-        # count_columns = len(new_column_set)
-        # num_cols = model.getNumCol()
-        # assert len(new_column_set) == num_cols, f"{num_cols} != {count_columns}"
-        
         model, new_column_set, vals = generateColumns(new_column_set, model, msg=False, solve_exact=True, branching_rule=node.branching_rule)  # Prove optimality on node
-
-        count_columns = len(new_column_set)
-        num_cols = model.getNumCol()
-        assert len(new_column_set) == num_cols, f"{num_cols} != {count_columns}"
         
-        # if len(new_column_set) > count_columns:
         node.value = sum(vals)
         node.final_columns = new_column_set
         node.final_columns_vals = vals
         node.final_fractional_columns = getFractionalColumns(vals, new_column_set)
     
         return True, model, node
-        # except Exception as e:
-        #     print(str(e))
-        #     False, model, node
 
     return False, model, node
 
@@ -472,7 +442,7 @@ def solveNode(node: Node, columns: list[list[int]], model: highspy.Highs):
 #
 def branchAndPrice(m, vals, columns, start_time=0):
     log_start_time = time.perf_counter()
-    header = ["NodesExpl", "TreeSize", "CurrCols", "BestFracCols", "UB", "Time"]
+    header = ["NodesExpl", "LastLayer", "TreeSize", "CurrCols", "BstFracCols", "IntSols", "UB", "Time"]
     row_format ="".join(["{:>"+f"{4+len(title)}"+"}" for title in header])
     print(row_format.format(*header))
 
@@ -489,6 +459,7 @@ def branchAndPrice(m, vals, columns, start_time=0):
     best_node = None
     best_count_frac_columns = math.inf
     count_nodes_visited = 0
+    count_int_sols = 0
 
     # if no fractional columns, then root node is an optimal integer solution
     if len(root_node.final_fractional_columns) == 0:
@@ -518,16 +489,15 @@ def branchAndPrice(m, vals, columns, start_time=0):
         #
         # i.e., maximize branch depth (layer), minimize number of fractional columns of its parent, 
         # and maximize value of its original fractional columns.
-        # last_layer = max(node.layer for node in branch_tree)
         node = min(branch_tree, key=lambda node: (
             -node.layer,
             -node.branching_rule[-1][2] if len(node.branching_rule) > 0 else 0,
             # len(node.parent.final_fractional_columns)/len(node.parent.final_columns) if node.parent is not None else math.inf,
             abs(round(node.branching_rule[-1][1]) - node.branching_rule[-1][1]) if len(node.branching_rule) > 0 else math.inf,
+            # abs(node.branching_rule[-1][1] - 0.5) if len(node.branching_rule) > 0 else math.inf,
             # -node.branching_rule[-1][2] if len(node.branching_rule) > 0 else 0,
         ))
-        # print(node.branching_rule)
-        # input()
+        last_layer = node.layer
         branch_tree.remove(node)
 
         # Solves the node with column generation
@@ -548,29 +518,34 @@ def branchAndPrice(m, vals, columns, start_time=0):
 
             # if no fractional columns, then this is an integer solution
             # update the best solution here for console output
-            if count_fractional_columns == 0 and node.value < best_obj:
-                best_obj = int(round(node.value, 0))  # avoid float precision issues
-                best_node = node
-                
-                # stop if we've found a provably optimal solution (using lower bound from RMP root node)
-                if rmp_LB == best_obj:
-                    break
+            if count_fractional_columns == 0:
+                count_int_sols += 1
+                if node.value < best_obj:
+                    best_obj = int(round(node.value, 0))  # avoid float precision issues
+                    best_node = node
+                    
+                    # stop if we've found a provably optimal solution (using lower bound from RMP root node)
+                    if rmp_LB == best_obj:
+                        break
 
             # found a less fractional solution or enough time has elapsed
             if count_fractional_columns < best_count_frac_columns or time.perf_counter()-log_start_time > 5:
                 best_count_frac_columns = min(best_count_frac_columns, count_fractional_columns)
                 print(row_format.format(*[
                     count_nodes_visited,
+                    last_layer,
                     len(branch_tree),
                     len(columns),
                     best_count_frac_columns,
-                    best_obj if best_obj < math.inf else "-",
+                    count_int_sols,
+                    best_obj if best_obj < math.inf else "inf",
                     f"{round(time.perf_counter()-start_time, 2) :.2f}"
                 ]))
                 log_start_time = time.perf_counter()
 
             # add all fractional columns as new branches
             if count_fractional_columns > 0:
+                # branch_tree = [node for node in branch_tree if last_layer-node.layer <= 5]
                 for r, s, _, integrality in getRowsToBranch(node):
                     for rule in range(2):
                         new_node = Node(node.layer + 1, ((r, s), integrality, rule), node)
