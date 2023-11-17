@@ -146,36 +146,40 @@ def createMasterProblem(columns: list):
 #
 #   z_{i} = 1 if item i is packed, 0 otherwise
 #
-def solveSubproblemExact(duals):
+def solveSubproblemExact(duals, sp: highspy.Highs=None):
     assert len(duals) == NumberItems
-    m = highspy.Highs()
-    m.setOptionValue('output_flag', False)
-    m.setOptionValue('random_seed', SEED)
 
-    m.addVars(NumberItems, [0]*NumberItems, [1]*NumberItems)
-    m.changeColsIntegrality(NumberItems, list(range(NumberItems)), [highspy.HighsVarType.kInteger]*NumberItems)
+    if sp is None:
+        sp = highspy.Highs()
+        sp.setOptionValue('output_flag', False)
+        sp.setOptionValue('random_seed', SEED)
 
-    # max \sum_{i} \mu_{i} * z_{i}
-    # where \mu_{i} is the dual variable for the i-th row of the master problem
-    m.changeColsCost(NumberItems, list(range(NumberItems)), duals)
-    m.changeObjectiveSense(highspy.ObjSense.kMaximize)
+        sp.addVars(NumberItems, [0]*NumberItems, [1]*NumberItems)
+        sp.changeColsIntegrality(NumberItems, list(range(NumberItems)), [highspy.HighsVarType.kInteger]*NumberItems)
 
-    #         sum_{i} w_{i} * z_{i} <= capacity, \foreach j
-    # -inf <= sum_{i} w_{i} * z_{i} <= capacity
-    m.addRow(
-        -highspy.kHighsInf,
-        BinCapacity,
-        NumberItems,
-        list(range(NumberItems)),
-        ItemWeights
-    )
+        # max \sum_{i} \mu_{i} * z_{i}
+        # where \mu_{i} is the dual variable for the i-th row of the master problem
+        sp.changeColsCost(NumberItems, list(range(NumberItems)), duals)
+        sp.changeObjectiveSense(highspy.ObjSense.kMaximize)
+
+        #         sum_{i} w_{i} * z_{i} <= capacity, \foreach j
+        # -inf <= sum_{i} w_{i} * z_{i} <= capacity
+        sp.addRow(
+            -highspy.kHighsInf,
+            BinCapacity,
+            NumberItems,
+            list(range(NumberItems)),
+            ItemWeights
+        )
+    else:
+        sp.changeColsCost(NumberItems, list(range(NumberItems)), duals)
     
-    m.run()
+    sp.run()
 
-    vals = list(m.getSolution().col_value)
+    vals = list(sp.getSolution().col_value)
     new_column = sorted([i for i in range(NumberItems) if vals[i] > 0.9])
 
-    return 1 - m.getObjectiveValue(), new_column
+    return 1 - sp.getObjectiveValue(), new_column, sp
 
 
 # Solve the knapsack subproblem with greedy heuristic
@@ -195,8 +199,8 @@ def solveSubproblemNotExact(duals):
 #
 # Generate columns for the master problem
 #
-def generateColumns(columns_: list[list[int]], m, msg=True, solve_exact = False, start_time = 0, in_branch_and_price = False):
-    columns = [column.copy() for column in columns_]
+def generateColumns(columns: list[list[int]], m, sp = None, msg=True, solve_exact = False, start_time = 0, in_branch_and_price = False):
+    # columns = [column.copy() for column in columns_]
     best_gap = math.inf
 
     iter = 0
@@ -209,7 +213,7 @@ def generateColumns(columns_: list[list[int]], m, msg=True, solve_exact = False,
         if not solve_exact:
             obj_sub, new_column = solveSubproblemNotExact(duals[:NumberItems])
         else:
-            obj_sub, new_column = solveSubproblemExact(duals[:NumberItems])
+            obj_sub, new_column, sp = solveSubproblemExact(duals[:NumberItems], sp=sp)
 
         if in_branch_and_price:
             obj_sub -= duals[-1]
@@ -260,7 +264,7 @@ def generateColumns(columns_: list[list[int]], m, msg=True, solve_exact = False,
         # Solves the master problem
         m.run()
 
-    return m, columns, list(solution.col_value)
+    return m, sp, columns, list(solution.col_value)
 
 
 #
@@ -269,6 +273,7 @@ def generateColumns(columns_: list[list[int]], m, msg=True, solve_exact = False,
 class Node:
     layer: int
     assigned_columns: list[int]
+    lb: tuple[bool, int]
 
     value: float
     final_columns: list[int]
@@ -279,6 +284,21 @@ class Node:
         self.layer = layer
         self.parent = parent
         self.assigned_columns = assigned_columns
+        self.lb = (True, 0)
+
+    def setLB(self, mp: highspy.Highs):
+        num_columns = mp.getNumCol()
+        lower_bounds = [1 if idx in self.assigned_columns else 0 for idx in range(num_columns)]
+        mp.changeColsBounds(
+            num_columns,                        # Qty columns to change bounds
+            list(range(num_columns)),           # Which columns
+            lower_bounds,                       # Lower bound (0 if not assigned else 1)
+            [1]*num_columns                     # Upper bound (always 1)
+        )
+        mp.run()
+        self.lb = (mp.getModelStatus() == highspy.HighsModelStatus.kOptimal, mp.getObjectiveValue())
+        return self
+
 
 
 def getFractionalColumns(vals: list, columns: list):
@@ -288,11 +308,10 @@ def getFractionalColumns(vals: list, columns: list):
     )
 
 
-def solveNode(node: Node, columns: list[list[int]], m):
+def solveNode(node: Node, columns: list[list[int]], mp, sp):
     # "enforce" the branch constraints, i.e., selected columns in the current node
     lower_bounds = [int(k in node.assigned_columns) for k in range(len(columns))]
-
-    m.changeColsBounds(
+    mp.changeColsBounds(
         len(columns),                       # Qty columns to change bounds
         list(range(len(columns))),          # Which columns
         lower_bounds,                       # Lower bound (0 if not assigned else 1)
@@ -302,11 +321,11 @@ def solveNode(node: Node, columns: list[list[int]], m):
     # Making sure that there is no repeated index
     assert len(node.assigned_columns) == len(set(node.assigned_columns))
 
-    m.run()
+    mp.run()
 
-    if m.getModelStatus() == highspy.HighsModelStatus.kOptimal:        
-        m, columns, vals = generateColumns(columns, m, msg=False, solve_exact=False, in_branch_and_price=True) # Generate columns quickly
-        m, columns, vals = generateColumns(columns, m, msg=False, solve_exact=True, in_branch_and_price=True)  # Prove optimality on node
+    if mp.getModelStatus() == highspy.HighsModelStatus.kOptimal:        
+        mp, _, columns, vals = generateColumns(columns, mp, msg=False, solve_exact=False, in_branch_and_price=True) # Generate columns quickly
+        mp, sp, columns, vals = generateColumns(columns, mp, sp=sp, msg=False, solve_exact=True, in_branch_and_price=True)  # Prove optimality on node
 
         assert len(columns) == len(vals)
 
@@ -317,9 +336,9 @@ def solveNode(node: Node, columns: list[list[int]], m):
 
         # ensure no column already assigned to 1 in the node is returned back with a fractional value
         assert len(set(node.final_fractional_columns).intersection(set(node.assigned_columns))) == 0
-        return True, m, node
+        return True, mp, sp, columns, node
     
-    return False, m, node
+    return False, mp, sp, columns, node
 
 
 #
@@ -332,7 +351,7 @@ def solveNode(node: Node, columns: list[list[int]], m):
 # Specifically, the code "up-branches" columns with fractional value in the RMP solution, i.e., forces specific columns 
 # to be selected in RMP.  The subproblems don't need to explicitly enforce this constraint (unlike other branching strategies).
 #
-def branchAndPrice(m, vals, columns, start_time=0):
+def branchAndPrice(mp, sp, vals, columns, start_time=0):
     log_start_time = time.perf_counter() 
     
     header = ["NodesExpl", "TreeSize", "CurrCols", "BstFracCols", "IntSols", "UB", "Time"]
@@ -346,7 +365,12 @@ def branchAndPrice(m, vals, columns, start_time=0):
     root_node.final_fractional_columns = getFractionalColumns(vals, columns)
 
     # create initial branches for each column with fractional value in RMP solution
-    branch_tree: list[Node] = [Node(0, [column_idx]) for column_idx in root_node.final_fractional_columns]
+    branch_tree: list[Node] = []
+    for column_idx in root_node.final_fractional_columns:
+        new_node = Node(0, [column_idx]).setLB(mp)
+        is_feasible, _ = new_node.lb
+        if is_feasible:
+            branch_tree += [new_node]
     branch_tree_dict = {frozenset(node.assigned_columns): node for node in branch_tree}
 
     # RMP lower bound can be rounded up to nearest integer (avoiding floating point precision issues)
@@ -364,7 +388,7 @@ def branchAndPrice(m, vals, columns, start_time=0):
         print(row_format.format(*[0, 0, len(columns), 0, best_node.value, f"{round(time.perf_counter()-start_time, 2) :.2f}" ]))
 
     # Adds cut 
-    m.addRow(
+    mp.addRow(
         rmp_LB,                                              # lhs
         highspy.kHighsInf,                                   # rhs
         len(columns),                                        # Number of non-zero variables
@@ -381,15 +405,15 @@ def branchAndPrice(m, vals, columns, start_time=0):
         # and maximize value of its original fractional columns.
         node = min(branch_tree, key=lambda node: (
             -node.layer,
+            # -len(node.assigned_columns),
             len(node.parent.final_fractional_columns) if node.parent is not None else math.inf,
-            # -node.parent.final_columns_vals[node.assigned_columns[-1]] if node.parent is not None else 0
+            -node.lb[1],
+            # abs(node.parent.final_columns_vals[node.assigned_columns[-1]]-0.5) if node.parent is not None else math.inf
         ))
         branch_tree.remove(node)
 
         # Solves the node with column generation
-        mp_is_feasible, m, node = solveNode(node, columns, m)
-        if mp_is_feasible and len(node.final_columns) > len(columns):
-            columns = node.final_columns
+        mp_is_feasible, mp, sp, columns, node = solveNode(node, columns, mp, sp)
         count_nodes_visited += 1
 
         # Only add columns if the master problem is feasible
@@ -431,9 +455,11 @@ def branchAndPrice(m, vals, columns, start_time=0):
                     key = frozenset(new_assigned_columns)
                     
                     if key not in branch_tree_dict:
-                        new_node = Node(node.layer + 1, new_assigned_columns, node)
-                        branch_tree = [new_node] + branch_tree
-                        branch_tree_dict[key] = new_node
+                        new_node = Node(node.layer + 1, new_assigned_columns, node).setLB(mp)
+                        is_feasible, lb = new_node.lb
+                        if is_feasible and lb < best_obj:
+                            branch_tree += [new_node]
+                            branch_tree_dict[key] = new_node
 
     # explored the entire tree, so best found solution is optimal
     if best_node is not None:
@@ -468,16 +494,16 @@ if __name__ == '__main__':
     # start with initial set of columns for feasible master problem
     start_time = time.perf_counter()
     columns = [[i] for i in range(NumberItems)] + greedy_bins
-    m, vals, duals = createMasterProblem(columns)
+    mp, vals, duals = createMasterProblem(columns)
     
     print("\nSolving root node:")
-    m, columns, vals = generateColumns(columns, m, solve_exact=False, start_time=start_time)
+    mp, _, columns, vals = generateColumns(columns, mp, solve_exact=False, start_time=start_time)
     
     print("\nProving optimality on root node:")
-    m, columns, vals = generateColumns(columns, m, solve_exact=True, start_time=start_time)
+    mp, sp, columns, vals = generateColumns(columns, mp, solve_exact=True, start_time=start_time)
 
     print("\nBranch-and-price:")
-    cg_bins = branchAndPrice(m, vals, columns, start_time)
+    cg_bins = branchAndPrice(mp, sp, vals, columns, start_time)
     cg_time = time.perf_counter()-start_time
 
     print(f"\nSolution by column generation: {len(cg_bins)} bins")
